@@ -21,6 +21,8 @@ from backtester import backtest_threshold, stress_test
 from allocator import allocate_budget
 from metrics import full_metrics, sharpe, sortino, max_drawdown, cvar, herfindahl, effective_n, sector_concentration, expected_dividend_income
 from profiler import QUESTIONS, evaluate
+import logbook
+import alerts
 from scheduler import start_scheduler, read_flag, next_market_close
 
 st.set_page_config(page_title="Inversiones PRO", page_icon="P",
@@ -77,9 +79,9 @@ def fmt_num(x, dec=2):
 st.sidebar.title("Inversiones PRO")
 st.sidebar.caption("Sistema profesional v3 - Metodologia institucional")
 
-PAGES = ["Inicio + Perfil","Dashboard","Carteras","Detalle activo",
+PAGES = ["Inicio + Perfil","Dashboard","Mi cartera real","Carteras","Detalle activo",
          "Optimizacion manual","Presupuesto y compras","Stress test",
-         "Backtesting","Ranking ML","Configuracion"]
+         "Backtesting","Ranking ML","Alertas email","Configuracion"]
 page = st.sidebar.radio("Navegacion", PAGES, index=0)
 
 st.sidebar.markdown("---")
@@ -310,6 +312,31 @@ if page == "Inicio + Perfil":
 elif page == "Dashboard":
     st.title("Dashboard")
     st.caption(f"Universo: {prices.shape[1]} activos | Datos hasta {prices.index[-1].date()}")
+
+    # === Banner de drift si hay cartera real registrada ===
+    try:
+        rec_map_d = {"Conservador":"min_vol","Moderado":"hrp","Crecimiento":"black_litterman","Agresivo":"max_sharpe_lw"}
+        _rec_key_d = rec_map_d.get(st.session_state.risk_profile, "hrp")
+        _w_target = portfolios.get(_rec_key_d, {})
+        if _w_target and not logbook.list_transactions().empty:
+            _md = logbook.max_drift(_w_target)
+            _thr = st.session_state.get("rebalance_threshold", 0.05)
+            if _md >= _thr:
+                _c1, _c2 = st.columns([3,1])
+                _c1.warning(f"Tu cartera real ha derivado **{_md*100:.2f}%** del objetivo (umbral {_thr*100:.1f}%). "
+                            f"Considera rebalancear. Pagina 'Mi cartera real' para detalles.")
+                if alerts.is_configured() and alerts.should_send_drift_alert():
+                    if _c2.button("Avisar por email"):
+                        _pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+                        _summary = _pv[1] if _pv else {}
+                        ok, msg = alerts.check_and_alert(_w_target,
+                            f"Recomendada ({_rec_key_d})", threshold=_thr, summary=_summary)
+                        if ok: st.success("Email enviado")
+                        else: st.error(msg)
+            elif _md > 0.001:
+                st.info(f"Drift actual: {_md*100:.2f}% (bajo umbral {_thr*100:.1f}%). Cartera alineada.")
+    except Exception:
+        pass
 
     # Recomendacion segun perfil
     rec_map = {
@@ -724,6 +751,187 @@ elif page == "Ranking ML":
 
 
 # ==================================================================
+# ==================================================================
+# PAGINA: MI CARTERA REAL (LOGBOOK)
+# ==================================================================
+elif page == "Mi cartera real":
+    st.title("Mi cartera real")
+    st.caption("Registra tus operaciones reales. La app calcula tu rentabilidad y drift.")
+
+    tabs = st.tabs(["Resumen", "Anadir operacion", "Historial", "Backup / Restaurar"])
+
+    with tabs[0]:
+        pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+        if pv is None:
+            st.info("Aun no hay operaciones registradas. Pestana 'Anadir operacion' para empezar.")
+        else:
+            df_pv, summary = pv
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Valor actual", fmt_eur(summary["total_value"]))
+            c2.metric("Invertido", fmt_eur(summary["total_invested"]))
+            c3.metric("P/L total", fmt_eur(summary["total_pl"]),
+                      delta=f"{summary['total_pl_pct']*100:+.2f}%")
+            c4.metric("Posiciones", len(df_pv))
+            if not df_pv.empty:
+                df_disp = df_pv.copy()
+                df_disp["nombre"] = df_disp["ticker"].map(lambda t: ASSETS.get(t,{}).get("name",t))
+                df_disp["cost_basis_eur"] = df_disp["cost_basis_eur"].apply(lambda x: fmt_eur(x,2))
+                df_disp["price_now_eur"] = df_disp["price_now_eur"].apply(lambda x: fmt_eur(x,2))
+                df_disp["value_eur"] = df_disp["value_eur"].apply(lambda x: fmt_eur(x,2))
+                df_disp["invested_eur"] = df_disp["invested_eur"].apply(lambda x: fmt_eur(x,2))
+                df_disp["pl_eur"] = df_disp["pl_eur"].apply(lambda x: fmt_eur(x,2))
+                df_disp["pl_pct"] = df_disp["pl_pct"].apply(fmt_pct)
+                df_disp["weight_actual"] = df_disp["weight_actual"].apply(fmt_pct)
+                st.dataframe(df_disp[["ticker","nombre","n_shares","cost_basis_eur",
+                    "price_now_eur","value_eur","invested_eur","pl_eur","pl_pct","weight_actual"]],
+                    use_container_width=True, hide_index=True)
+
+                st.subheader("Drift vs cartera objetivo")
+                rec_map_d = {"Conservador":"min_vol","Moderado":"hrp","Crecimiento":"black_litterman","Agresivo":"max_sharpe_lw"}
+                rec_key_d = rec_map_d.get(st.session_state.risk_profile, "hrp")
+                target_choice = st.selectbox("Compara con cartera",
+                    options=PORTFOLIO_NAMES,
+                    index=PORTFOLIO_NAMES.index(rec_key_d),
+                    format_func=lambda k: PORTFOLIO_LABELS[k])
+                w_target = portfolios.get(target_choice, {})
+                drifts = logbook.drift_vs_target(w_target)
+                if drifts:
+                    drift_rows = []
+                    for t, d in sorted(drifts.items(), key=lambda x: -abs(x[1])):
+                        if abs(d) < 0.005: continue
+                        drift_rows.append({"ticker":t,
+                            "nombre":ASSETS.get(t,{}).get("name",t),
+                            "drift":fmt_pct(d),
+                            "accion":"Vender" if d>0 else "Comprar"})
+                    if drift_rows:
+                        st.dataframe(pd.DataFrame(drift_rows), use_container_width=True, hide_index=True)
+                    md = logbook.max_drift(w_target)
+                    thr = st.session_state.get("rebalance_threshold", 0.05)
+                    if md >= thr:
+                        st.error(f"Drift maximo: {md*100:.2f}% (>= umbral {thr*100:.1f}%). REBALANCEO RECOMENDADO.")
+                    else:
+                        st.success(f"Drift maximo: {md*100:.2f}% (< umbral {thr*100:.1f}%). Cartera alineada.")
+
+    with tabs[1]:
+        st.subheader("Registrar nueva operacion")
+        with st.form("new_tx"):
+            c1, c2 = st.columns(2)
+            tx_ticker = c1.selectbox("Ticker", options=ASSET_LIST,
+                format_func=lambda t: f"{t} - {ASSETS.get(t,{}).get('name',t)}")
+            tx_side = c2.selectbox("Tipo", options=["buy","sell"],
+                format_func=lambda x: "Compra" if x=="buy" else "Venta")
+            c1, c2, c3 = st.columns(3)
+            tx_shares = c1.number_input("N. acciones", min_value=0.0001, value=1.0, step=0.0001, format="%.4f")
+            tx_price = c2.number_input("Precio (EUR)", min_value=0.01, value=100.0, step=0.01)
+            tx_comm = c3.number_input("Comision (EUR)", min_value=0.0, value=1.0, step=0.1)
+            tx_date = st.date_input("Fecha")
+            tx_notes = st.text_input("Notas (opcional)")
+            submit_tx = st.form_submit_button("Anadir operacion", type="primary")
+        if submit_tx:
+            try:
+                logbook.add_transaction(tx_ticker, tx_side, tx_shares, tx_price,
+                    commission_eur=tx_comm, broker=st.session_state.broker,
+                    notes=tx_notes, date=str(tx_date))
+                st.success(f"Operacion registrada: {tx_side.upper()} {tx_shares} {tx_ticker} @ {tx_price} EUR")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    with tabs[2]:
+        df_hist = logbook.list_transactions()
+        if df_hist.empty:
+            st.info("Sin operaciones registradas.")
+        else:
+            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            with st.expander("Eliminar operacion"):
+                tx_id_del = st.number_input("ID a eliminar", min_value=1, step=1)
+                if st.button("Eliminar"):
+                    logbook.delete_transaction(int(tx_id_del))
+                    st.success("Eliminada")
+                    st.rerun()
+
+    with tabs[3]:
+        st.subheader("Backup")
+        st.write("Descarga tus operaciones como JSON. Importante en cloud (Streamlit) "
+                 "porque la base de datos local se borra cuando la app se reinicia.")
+        json_data = logbook.export_json()
+        st.download_button("Descargar backup JSON", data=json_data,
+            file_name=f"logbook_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json")
+        st.subheader("Restaurar desde JSON")
+        up = st.file_uploader("Subir archivo JSON", type=["json"])
+        if up is not None:
+            content = up.read().decode("utf-8")
+            n = logbook.import_json(content)
+            if n >= 0:
+                st.success(f"{n} operaciones importadas")
+                st.rerun()
+            else:
+                st.error("Error al parsear JSON")
+
+
+# ==================================================================
+# PAGINA: ALERTAS EMAIL
+# ==================================================================
+elif page == "Alertas email":
+    st.title("Alertas por email")
+    st.caption("Configura tu Gmail para recibir avisos cuando tu cartera real derive del objetivo.")
+
+    st.subheader("Como configurar Gmail (App Password)")
+    st.markdown("""
+    1. Ve a tu cuenta Google -> Seguridad -> verifica que tienes verificacion en 2 pasos activada.
+    2. Entra en https://myaccount.google.com/apppasswords
+    3. Genera una contrasena de aplicacion (nombre: "Inversiones PRO").
+    4. Copia los 16 caracteres que te da (sin espacios) y pegalo en 'Contrasena Gmail' aqui abajo.
+    5. **Importante:** NO uses tu contrasena normal de Gmail, no funciona desde apps externas.
+    """)
+
+    st.subheader("Configuracion")
+    with st.form("email_cfg"):
+        c1, c2 = st.columns(2)
+        sender = c1.text_input("Email Gmail (remitente)",
+            value=st.session_state.get("email_sender", ""))
+        password = c2.text_input("Contrasena de aplicacion (16 chars)",
+            value=st.session_state.get("email_password", ""), type="password")
+        recipient = st.text_input("Email destinatario",
+            value=st.session_state.get("email_recipient", sender or ""))
+        save_cfg = st.form_submit_button("Guardar configuracion")
+    if save_cfg:
+        st.session_state.email_sender = sender
+        st.session_state.email_password = password
+        st.session_state.email_recipient = recipient
+        st.success("Configuracion guardada (en sesion). Para persistir entre sesiones en cloud, "
+                   "anade los valores a Streamlit Secrets.")
+
+    st.markdown("---")
+    st.subheader("Probar envio")
+    if alerts.is_configured():
+        if st.button("Enviar email de prueba"):
+            ok, msg = alerts.send_email("Inversiones PRO - prueba",
+                "<h2>Email de prueba</h2><p>Si lees esto, tu configuracion funciona.</p>")
+            if ok: st.success(msg)
+            else: st.error(msg)
+    else:
+        st.info("Configura los 3 campos arriba para activar.")
+
+    st.markdown("---")
+    st.subheader("Historial de envios")
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        log_path = _P(__file__).parent / "alerts_log.json"
+        if log_path.exists():
+            log = _j.loads(log_path.read_text())
+            if log:
+                st.dataframe(pd.DataFrame(log[-20:][::-1]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Sin envios registrados.")
+        else:
+            st.caption("Sin envios registrados aun.")
+    except Exception:
+        st.caption("Sin historial.")
+
+
 # PAGINA: CONFIGURACION
 # ==================================================================
 elif page == "Configuracion":
