@@ -592,36 +592,61 @@ elif page == "Presupuesto y compras":
 # ==================================================================
 elif page == "Stress test":
     st.title("Stress test - Como te habria ido en crisis pasadas")
-    st.caption("Aplica los retornos historicos reales de cada crisis a las carteras propuestas.")
-    rows = []
-    for port_key in PORTFOLIO_NAMES:
-        w = portfolios.get(port_key, {})
-        if not w: continue
+    st.caption("Aplica los retornos historicos reales de cada crisis a las carteras propuestas. Descarga datos largos al pulsar el boton (puede tardar 30-60s la primera vez).")
+
+    @st.cache_data(ttl=86400, show_spinner="Descargando historial largo (max 25y)...")
+    def _load_long_history(tickers):
+        from data_loader import fetch_prices
+        return fetch_prices(list(tickers), period="max")
+
+    if st.button("Ejecutar stress test", type="primary"):
+        tickers_needed = set()
+        for w in portfolios.values():
+            tickers_needed.update([k for k, v in w.items() if v > 0.001])
+        if not tickers_needed:
+            st.warning("No hay carteras construidas todavia.")
+        else:
+            long_prices = _load_long_history(tuple(sorted(tickers_needed)))
+            if long_prices is None or long_prices.empty:
+                st.error("No se pudo descargar historial largo.")
+            else:
+                rows = []
+                for port_key in PORTFOLIO_NAMES:
+                    w = portfolios.get(port_key, {})
+                    if not w: continue
+                    for sname, sdates in STRESS_SCENARIOS.items():
+                        r = stress_test(long_prices, w, sdates)
+                        if r is None: continue
+                        rows.append({
+                            "Cartera": PORTFOLIO_LABELS[port_key],
+                            "Crisis": sname,
+                            "Periodo": f"{r['start']} -> {r['end']}",
+                            "Retorno total": fmt_pct(r["total_return"]),
+                            "Max DD": fmt_pct(r["max_drawdown"]),
+                            "Dias": r["n_days"],
+                        })
+                if not rows:
+                    st.warning("Ningun activo de las carteras tiene historial suficiente para los escenarios. "
+                               "Esto suele pasar con ETFs jovenes (post-2018). "
+                               "Cambia a una cartera con activos antiguos (AAPL, MSFT, JNJ, KO) en la pagina Carteras.")
+                else:
+                    df = pd.DataFrame(rows)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    try:
+                        pivot = df.pivot(index="Cartera", columns="Crisis", values="Retorno total")
+                        pivot_num = pivot.apply(lambda col: col.str.rstrip("%").astype(float))
+                        fig = px.imshow(pivot_num, text_auto=".1f", aspect="auto",
+                                        color_continuous_scale="RdYlGn", origin="lower",
+                                        title="Retorno por cartera y crisis (%)")
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception:
+                        pass
+                    st.caption(f"Activos con historial disponible: {long_prices.shape[1]} de {len(tickers_needed)} solicitados.")
+    else:
+        st.info("Pulsa 'Ejecutar stress test' para empezar. La primera ejecucion descarga 25 anos de historial (cacheado 24h despues).")
+        st.markdown("**Crisis evaluadas:**")
         for sname, sdates in STRESS_SCENARIOS.items():
-            r = stress_test(prices_full, w, sdates)
-            if r is None: continue
-            rows.append({
-                "Cartera": PORTFOLIO_LABELS[port_key],
-                "Crisis": sname,
-                "Periodo": f"{r['start']} -> {r['end']}",
-                "Retorno total": fmt_pct(r["total_return"]),
-                "Max DD": fmt_pct(r["max_drawdown"]),
-                "Dias": r["n_days"],
-            })
-    if rows:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        # Heatmap de retornos por cartera x crisis
-        try:
-            pivot = df.pivot(index="Cartera", columns="Crisis", values="Retorno total")
-            # Convertir % string a numero
-            pivot_num = pivot.apply(lambda col: col.str.rstrip("%").astype(float))
-            fig = px.imshow(pivot_num, text_auto=".1f", aspect="auto",
-                            color_continuous_scale="RdYlGn", origin="lower",
-                            title="Retorno por cartera y crisis (%)")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            pass
+            st.write(f"- **{sname}** ({sdates['start']} a {sdates['end']})")
 
 
 # ==================================================================
