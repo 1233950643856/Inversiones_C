@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+last_update.json
+.DS_Store
+*.bak
