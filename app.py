@@ -23,6 +23,10 @@ from metrics import full_metrics, sharpe, sortino, max_drawdown, cvar, herfindah
 from profiler import QUESTIONS, evaluate
 import logbook
 import alerts
+import ai_provider
+import coach_ai
+import news_ai
+import report_ai
 from scheduler import start_scheduler, read_flag, next_market_close
 
 st.set_page_config(page_title="Inversiones PRO", page_icon="P",
@@ -79,9 +83,10 @@ def fmt_num(x, dec=2):
 st.sidebar.title("Inversiones PRO")
 st.sidebar.caption("Sistema profesional v3 - Metodologia institucional")
 
-PAGES = ["Inicio + Perfil","Dashboard","Mi cartera real","Carteras","Detalle activo",
+PAGES = ["Inicio + Perfil","Dashboard","Mi cartera real","Asistente IA",
+         "Coach de sesgos","Informe mensual","Carteras","Detalle activo",
          "Optimizacion manual","Presupuesto y compras","Stress test",
-         "Backtesting","Ranking ML","Alertas email","Configuracion"]
+         "Backtesting","Ranking ML","Alertas email","Configuracion IA","Configuracion"]
 page = st.sidebar.radio("Navegacion", PAGES, index=0)
 
 st.sidebar.markdown("---")
@@ -361,6 +366,27 @@ elif page == "Dashboard":
         c2.metric("Sortino", fmt_num(m["Sortino"]))
         c3.metric("Calmar", fmt_num(m["Calmar"]))
         c4.metric("Omega", fmt_num(m["Omega (>0)"]))
+
+
+    # === Insight diario IA (cacheado 6h) ===
+    if ai_provider.is_configured():
+        with st.expander("Insight diario (IA)", expanded=True):
+            try:
+                last_rets = returns.tail(1)
+                if not last_rets.empty:
+                    today_movers = sorted([(c, float(last_rets.iloc[0][c]))
+                                           for c in last_rets.columns
+                                           if pd.notna(last_rets.iloc[0][c])],
+                                          key=lambda x: -abs(x[1]))[:10]
+                    pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+                    pf_summary = pv[1] if pv else None
+                    insight = news_ai.daily_market_insight(today_movers, pf_summary)
+                    st.write(insight)
+                    st.caption(f"Generado por IA. Cacheado 6 horas.")
+            except Exception as _e:
+                st.caption(f"Insight no disponible: {_e}")
+    else:
+        st.info("Activa el Asistente IA en 'Configuracion IA' para ver insights diarios y mucho mas.")
 
     st.markdown("---")
     st.subheader("Top 10 oportunidades segun el modelo ML")
@@ -930,6 +956,237 @@ elif page == "Alertas email":
             st.caption("Sin envios registrados aun.")
     except Exception:
         st.caption("Sin historial.")
+
+
+# ==================================================================
+# PAGINA: ASISTENTE IA (CHAT CON CONTEXTO DE TU CARTERA)
+# ==================================================================
+elif page == "Asistente IA":
+    st.title("Asistente IA")
+    st.caption("Chat con IA que conoce tu perfil, tu cartera y los datos del mercado.")
+    if not ai_provider.is_configured():
+        st.warning("Configura tu API key gratuita en 'Configuracion IA' para usar el asistente.")
+    else:
+        if "ai_chat_history" not in st.session_state:
+            st.session_state.ai_chat_history = []
+
+        # Mostrar historial
+        for msg in st.session_state.ai_chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Entrada
+        user_q = st.chat_input("Pregunta lo que quieras (cartera, metodologia, mercado...)")
+        if user_q:
+            st.session_state.ai_chat_history.append({"role":"user","content":user_q})
+            with st.chat_message("user"):
+                st.markdown(user_q)
+
+            # Construir contexto rico
+            pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+            ctx_parts = [
+                f"Perfil de la usuaria: {st.session_state.risk_profile}",
+                f"Horizonte: {st.session_state.horizon}",
+                f"Presupuesto: {st.session_state.budget} EUR",
+                f"Broker: {st.session_state.broker}",
+                f"Universo activo: {prices.shape[1]} activos",
+            ]
+            if pv:
+                _, _summ = pv
+                ctx_parts.append(f"Cartera real: {_summ['total_value']:.2f} EUR (P/L {_summ['total_pl_pct']*100:+.2f}%)")
+            # Top recomendaciones del modelo
+            if not ranking.empty:
+                top5 = ranking.head(5)
+                tops = ", ".join([f"{r['ticker']} (pred {r['predicted_return']*100:+.1f}%)"
+                                  for _, r in top5.iterrows()])
+                ctx_parts.append(f"Top 5 ranking ML: {tops}")
+            ctx_str = "\n".join(ctx_parts)
+
+            system = (f"Eres asesora financiera personal de la usuaria. Usa el contexto siguiente "
+                      f"para dar respuestas relevantes. Habla en espanol cercano. NO hagas "
+                      f"recomendaciones de compra/venta concretas: explica metodologias, ayuda a "
+                      f"entender, advierte de riesgos. Si te piden predicciones, recuerda que el "
+                      f"mercado es impredecible y enfoca en gestion de riesgo.\n\n"
+                      f"CONTEXTO:\n{ctx_str}")
+
+            with st.chat_message("assistant"):
+                with st.spinner("Pensando..."):
+                    res = ai_provider.ask(user_q, system, max_tokens=600)
+                    answer = res.get("text") or f"Error: {res.get('error')}"
+                    st.markdown(answer)
+                    if res.get("provider"):
+                        st.caption(f"Proveedor: {res['provider']}")
+            st.session_state.ai_chat_history.append({"role":"assistant","content":answer})
+
+        if st.button("Borrar conversacion"):
+            st.session_state.ai_chat_history = []
+            st.rerun()
+
+
+# ==================================================================
+# PAGINA: COACH DE SESGOS COGNITIVOS
+# ==================================================================
+elif page == "Coach de sesgos":
+    st.title("Coach de sesgos cognitivos")
+    st.caption("Analiza tu comportamiento de inversion y detecta patrones psicologicos perjudiciales.")
+    if not ai_provider.is_configured():
+        st.warning("Configura tu API key en 'Configuracion IA' para activar el coach.")
+    else:
+        st.markdown("""
+        El coach analiza tres fuentes:
+        - Tus operaciones reales (logbook)
+        - Tu uso de la app (frecuencia de visitas, paginas que consultas)
+        - El comportamiento del mercado en relacion a tus activos
+
+        Detecta los principales sesgos cognitivos identificados en la literatura:
+        loss aversion, disposition effect, overtrading, status quo, recency bias, anchoring.
+        """)
+
+        coach_ai.log_event("page_view", {"page":"coach"})
+
+        if st.button("Ejecutar analisis", type="primary"):
+            transactions_df = logbook.list_transactions()
+            pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+            positions_df = pv[0] if pv else None
+            # Returns recientes para detector de recency
+            recent_rets = None
+            if positions_df is not None and not positions_df.empty:
+                cols = [t for t in positions_df["ticker"] if t in prices.columns]
+                if cols:
+                    weights = {r["ticker"]:r["weight_actual"] for _,r in positions_df.iterrows()
+                              if r["ticker"] in cols}
+                    recent_rets = pd.Series(portfolio_returns_series(weights, prices))
+            # Mercado en caida hoy
+            market_drop = False
+            try:
+                last_day_returns = returns.iloc[-1]
+                market_drop = (last_day_returns < -0.01).mean() > 0.5
+            except Exception:
+                pass
+
+            detections = coach_ai.all_detections(
+                positions_df, transactions_df, st.session_state.budget,
+                market_dropped_today=market_drop, returns_series=recent_rets,
+                expected_monthly_contribution=None,
+            )
+            if not detections:
+                st.success("No se han detectado sesgos significativos. Comportamiento equilibrado.")
+            else:
+                st.subheader("Sesgos detectados")
+                for d in detections:
+                    sev_color = {"alto":"red","medio":"orange","bajo":"blue"}.get(d.get("severity","bajo"),"blue")
+                    st.markdown(f":{sev_color}[**{d['bias']}**] - {d['evidence']}")
+                st.markdown("---")
+                with st.spinner("Generando consejo personalizado..."):
+                    advice = coach_ai.explain_with_ai(detections)
+                st.subheader("Consejo del coach")
+                st.write(advice)
+
+
+# ==================================================================
+# PAGINA: INFORME MENSUAL IA
+# ==================================================================
+elif page == "Informe mensual":
+    st.title("Informe mensual con IA")
+    st.caption("Genera un informe escrito personalizado de tu cartera con analisis IA.")
+    if not ai_provider.is_configured():
+        st.warning("Configura tu API key en 'Configuracion IA' para generar informes.")
+    else:
+        if st.button("Generar informe del mes", type="primary"):
+            transactions_df = logbook.list_transactions()
+            pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
+            if pv is None:
+                st.warning("Necesitas registrar al menos una operacion en 'Mi cartera real' antes.")
+            else:
+                positions_df, summary = pv
+                # Metricas de la cartera real
+                cols = [t for t in positions_df["ticker"] if t in prices.columns]
+                metrics_dict = {}
+                if cols:
+                    weights = {r["ticker"]:r["weight_actual"] for _,r in positions_df.iterrows()
+                              if r["ticker"] in cols}
+                    rets = pd.Series(portfolio_returns_series(weights, prices))
+                    if len(rets) > 30:
+                        m = full_metrics(rets, benchmark_series(prices), rf=0.02)
+                        for k,v in m.items():
+                            if k in ("Retorno anual","Volatilidad","Max Drawdown","CVaR 95% (ES)"):
+                                metrics_dict[k] = fmt_pct(v)
+                            elif isinstance(v, (int,float)):
+                                metrics_dict[k] = fmt_num(v,2)
+                rec_map_d = {"Conservador":"min_vol","Moderado":"hrp","Crecimiento":"black_litterman","Agresivo":"max_sharpe_lw"}
+                target_key = rec_map_d.get(st.session_state.risk_profile, "hrp")
+
+                with st.spinner("Generando informe (puede tardar 10-30s)..."):
+                    rep = report_ai.generate_monthly_report(
+                        summary, positions_df, transactions_df, metrics_dict,
+                        st.session_state.risk_profile, st.session_state.horizon,
+                        PORTFOLIO_LABELS.get(target_key, "Recomendada"))
+                st.success(f"Informe generado por {rep.get('provider','IA')}")
+                st.markdown("---")
+                st.markdown(rep["narrative"])
+                st.download_button(
+                    "Descargar informe HTML",
+                    data=rep["html"],
+                    file_name=f"informe_{datetime.now().strftime('%Y%m%d')}.html",
+                    mime="text/html",
+                )
+
+
+# ==================================================================
+# PAGINA: CONFIGURACION IA (API keys)
+# ==================================================================
+elif page == "Configuracion IA":
+    st.title("Configuracion IA")
+    st.caption("Conecta proveedores de IA gratuitos. Solo necesitas UNA, las demas son de respaldo.")
+
+    st.markdown("""
+    ### Proveedores recomendados (todos GRATIS para uso personal)
+
+    **1. Groq (recomendado, primario):** modelos Llama 3.3 70B, muy rapido (1-2s respuesta).
+    Cuota: 14.400 requests/dia.
+    - Registro: https://console.groq.com/
+    - Ve a "API Keys" -> "Create API Key" -> copia el valor
+
+    **2. Google Gemini (respaldo):** modelo Gemini 1.5 Flash.
+    Cuota: 1500 requests/dia.
+    - Registro: https://aistudio.google.com/apikey
+    - Pulsa "Create API key" -> copia
+
+    **3. Cerebras (segundo respaldo):** Llama 3.1 70B.
+    Cuota: 14.400 requests/dia.
+    - Registro: https://cloud.cerebras.ai/
+    - Ve a API Keys -> Create -> copia
+    """)
+    st.markdown("---")
+
+    with st.form("ai_keys"):
+        groq_key = st.text_input("Groq API Key (recomendada)",
+            value=st.session_state.get("GROQ_API_KEY",""), type="password")
+        gemini_key = st.text_input("Gemini API Key (opcional)",
+            value=st.session_state.get("GEMINI_API_KEY",""), type="password")
+        cerebras_key = st.text_input("Cerebras API Key (opcional)",
+            value=st.session_state.get("CEREBRAS_API_KEY",""), type="password")
+        save = st.form_submit_button("Guardar claves", type="primary")
+    if save:
+        st.session_state.GROQ_API_KEY = groq_key
+        st.session_state.GEMINI_API_KEY = gemini_key
+        st.session_state.CEREBRAS_API_KEY = cerebras_key
+        st.success("Claves guardadas (en sesion). Para persistir en cloud, anadelas a Streamlit Secrets.")
+
+    st.markdown("---")
+    st.subheader("Test de conexion")
+    if ai_provider.is_configured():
+        if st.button("Probar IA"):
+            with st.spinner("Llamando a IA..."):
+                res = ai_provider.ask("Di hola en una frase corta.",
+                                       system="Eres asistente financiero conciso.",
+                                       max_tokens=50)
+            if res.get("text"):
+                st.success(f"OK ({res['provider']}): {res['text']}")
+            else:
+                st.error(f"Error: {res.get('error')}")
+    else:
+        st.info("Anade al menos una clave API y guarda para activar.")
 
 
 # PAGINA: CONFIGURACION
