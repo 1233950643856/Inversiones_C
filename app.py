@@ -513,6 +513,25 @@ elif page == "Detalle activo":
             c1.metric("Retorno predicho (~21d)", fmt_pct(row["predicted_return"]))
             c2.metric("Confianza", fmt_num(row["confidence"],3))
             c3.metric("Score combinado", fmt_num(row["score"],4))
+
+        # === Noticias con IA ===
+        st.markdown("---")
+        st.subheader("Noticias recientes (IA)")
+        if not ai_provider.is_configured():
+            st.info("Configura tu API key en 'Configuracion IA' para activar el resumen de noticias.")
+        else:
+            colA, colB = st.columns([3,1])
+            colA.caption("La IA descarga las ultimas noticias de Yahoo Finance, las filtra por relevancia y te las resume en 3-5 bullets.")
+            if colB.button("Resumir noticias con IA", key=f"news_btn_{sel}"):
+                with st.spinner("Buscando y resumiendo noticias..."):
+                    asset_name = ASSETS.get(sel, {}).get("name", sel)
+                    res = news_ai.summarize_for_ticker(sel, asset_name)
+                if res.get("summary"):
+                    st.markdown(res["summary"])
+                if res.get("raw"):
+                    with st.expander(f"Ver titulares originales ({len(res['raw'])})"):
+                        for n in res["raw"]:
+                            st.markdown(f"- [{n['title']}]({n['link']})  \n  *{n['date']}*")
         # Metricas historicas
         rets_a = prices[sel].pct_change().dropna()
         if len(rets_a) > 60:
