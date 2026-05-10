@@ -537,15 +537,19 @@ elif page == "Detalle activo":
         if len(rets_a) > 60:
             st.subheader("Metricas historicas (5y)")
             m = full_metrics(rets_a, benchmark_series(prices), rf=0.02)
-            data = pd.DataFrame.from_dict(m, orient="index", columns=["valor"])
-            for k in data.index:
-                v = data.loc[k,"valor"]
+            # Construir el dataframe ya con strings para evitar TypeError en pandas nuevo
+            formatted = {}
+            for k, v in m.items():
                 if k in ("Retorno anual","Volatilidad","Max Drawdown","VaR 95%","CVaR 95% (ES)","VaR 99%","CVaR 99%","% meses positivos"):
-                    data.loc[k,"valor"] = fmt_pct(v)
+                    formatted[k] = fmt_pct(v)
                 elif k == "DD duracion (dias)":
-                    data.loc[k,"valor"] = f"{int(v) if v else 0}"
+                    try:
+                        formatted[k] = f"{int(v) if v else 0}"
+                    except Exception:
+                        formatted[k] = "-"
                 else:
-                    data.loc[k,"valor"] = fmt_num(v,3)
+                    formatted[k] = fmt_num(v, 3)
+            data = pd.DataFrame.from_dict(formatted, orient="index", columns=["valor"])
             st.dataframe(data, use_container_width=True)
 
 
