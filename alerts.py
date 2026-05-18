@@ -1,15 +1,21 @@
-"""Alertas de drift y comunicacion por email (Gmail SMTP)."""
+"""Alertas drift y comunicacion email. Log persistente en Supabase si esta disponible."""
 import smtplib, ssl, json
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import streamlit as st
 
+try:
+    import supabase_db
+    HAS_SUPABASE = True
+except Exception:
+    HAS_SUPABASE = False
+
 ALERTS_LOG = Path(__file__).parent / "alerts_log.json"
 
+
 def get_config():
-    """Lee configuracion email de st.secrets (cloud) o session_state (local)."""
     cfg = {}
     try:
         if "email" in st.secrets:
@@ -26,12 +32,13 @@ def get_config():
         cfg["recipient"] = st.session_state.email_recipient
     return cfg
 
+
 def is_configured():
     cfg = get_config()
     return bool(cfg.get("sender") and cfg.get("password") and cfg.get("recipient"))
 
+
 def send_email(subject, body_html, body_text=None):
-    """Envia email via Gmail SMTP. Devuelve (ok, mensaje)."""
     cfg = get_config()
     if not is_configured():
         return False, "Configuracion incompleta (sender, password, recipient)"
@@ -59,18 +66,35 @@ def send_email(subject, body_html, body_text=None):
         _log_send(subject, f"ERROR: {e}")
         return False, f"Error: {e}"
 
+
 def _log_send(subject, status):
+    # Supabase si esta configurado
+    if HAS_SUPABASE and supabase_db.is_configured():
+        try:
+            supabase_db.log_alert(subject, status)
+            return
+        except Exception:
+            pass
+    # Fallback local
     try:
         log = []
         if ALERTS_LOG.exists():
             log = json.loads(ALERTS_LOG.read_text())
         log.append({"ts": datetime.now().isoformat(), "subject": subject, "status": status})
-        log = log[-100:]  # solo ultimos 100
+        log = log[-100:]
         ALERTS_LOG.write_text(json.dumps(log, indent=2))
     except Exception:
         pass
 
+
 def last_send_time(subject_prefix=""):
+    # Supabase si esta configurado
+    if HAS_SUPABASE and supabase_db.is_configured():
+        try:
+            return supabase_db.last_alert_time(subject_prefix)
+        except Exception:
+            pass
+    # Fallback local
     if not ALERTS_LOG.exists(): return None
     try:
         log = json.loads(ALERTS_LOG.read_text())
@@ -81,14 +105,15 @@ def last_send_time(subject_prefix=""):
         pass
     return None
 
+
 def should_send_drift_alert(cooldown_hours=24):
-    """No spamear: minimo cooldown_hours entre envios de drift."""
     last = last_send_time("Alerta drift")
     if last is None: return True
-    return datetime.now() - last > timedelta(hours=cooldown_hours)
+    now = datetime.now(timezone.utc) if last.tzinfo else datetime.now()
+    return now - last > timedelta(hours=cooldown_hours)
+
 
 def build_drift_email(drift_dict, max_drift, threshold, target_label, summary):
-    """Construye email HTML con detalle del drift."""
     rows_html = ""
     for t, d in sorted(drift_dict.items(), key=lambda x: -abs(x[1])):
         if abs(d) < 0.005: continue
@@ -124,8 +149,8 @@ def build_drift_email(drift_dict, max_drift, threshold, target_label, summary):
            f"P/L: {summary.get('total_pl', 0):+.2f} EUR."
     return html, text
 
+
 def check_and_alert(target_weights, target_label, threshold=0.05, summary=None):
-    """Comprueba drift y envia email si supera umbral. Devuelve (sent, message)."""
     from logbook import drift_vs_target, max_drift as mdrift
     drifts = drift_vs_target(target_weights)
     if not drifts:

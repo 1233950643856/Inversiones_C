@@ -23,6 +23,7 @@ from metrics import full_metrics, sharpe, sortino, max_drawdown, cvar, herfindah
 from profiler import QUESTIONS, evaluate
 import logbook
 import alerts
+import supabase_db
 import ai_provider
 import coach_ai
 import news_ai
@@ -44,6 +45,63 @@ _PWA_HTML = """
 """
 _components.html(f'<script>parent.document.head.insertAdjacentHTML("beforeend", `{_PWA_HTML}`);</script>', height=0)
 
+
+
+# === WEBHOOK CRON-JOB: comprueba drift y envia email ===
+def _webhook_check_drift():
+    """Endpoint llamado por cron-job.org. Comprueba drift y envia email si procede."""
+    import logbook as _lb
+    from data_loader import load_universe, fetch_eur_usd
+    try:
+        _prices, _fund = load_universe(period="3mo")
+        if _prices is None or _prices.empty:
+            return False, "Sin datos de mercado"
+        _eur_usd = fetch_eur_usd()
+        # Necesitamos las carteras objetivo - reconstruccion minima de la cartera por defecto
+        from optimizer import hrp_optimize
+        from data_loader import daily_returns
+        _R = daily_returns(_prices)
+        _w_target = hrp_optimize(_R)
+        _md = _lb.max_drift(_w_target)
+        _thr = 0.05
+        if _md < _thr:
+            alerts.log_alert if False else None
+            try:
+                supabase_db.log_alert("Cron drift check", f"OK: drift {_md*100:.2f}% < threshold")
+            except Exception:
+                pass
+            return False, f"Drift {_md*100:.2f}% bajo umbral, no envio."
+        _pv = _lb.portfolio_value(_prices.iloc[-1], _eur_usd)
+        _summary = _pv[1] if _pv else {}
+        ok, msg = alerts.check_and_alert(_w_target, "HRP (cron)", threshold=_thr, summary=_summary)
+        return ok, msg
+    except Exception as e:
+        return False, f"Error: {e}"
+
+try:
+    _qp = st.query_params
+    _action = _qp.get("action", "")
+    _token = _qp.get("token", "")
+    _expected_token = ""
+    try:
+        _expected_token = st.secrets.get("CRON_TOKEN", "")
+    except Exception:
+        pass
+    if _action == "check_drift" and _expected_token and _token == _expected_token:
+        st.title("Webhook ejecutandose")
+        with st.spinner("Comprobando drift..."):
+            _ok, _msg = _webhook_check_drift()
+        if _ok:
+            st.success(f"Email enviado: {_msg}")
+        else:
+            st.info(f"Sin envio: {_msg}")
+        st.caption(f"Timestamp: {now_cet().strftime('%Y-%m-%d %H:%M %Z')}")
+        st.stop()
+    elif _action == "check_drift":
+        st.error("Token invalido o no configurado.")
+        st.stop()
+except Exception:
+    pass
 
 # Inicializar scheduler una sola vez
 if "scheduler_started" not in st.session_state:
@@ -810,6 +868,7 @@ elif page == "Mi cartera real":
     tabs = st.tabs(["Resumen", "Anadir operacion", "Historial", "Backup / Restaurar"])
 
     with tabs[0]:
+        st.caption(f"Backend de almacenamiento: **{logbook.get_backend_info()}**")
         pv = logbook.portfolio_value(prices.iloc[-1], eur_usd)
         if pv is None:
             st.info("Aun no hay operaciones registradas. Pestana 'Anadir operacion' para empezar.")
@@ -1230,6 +1289,29 @@ elif page == "Configuracion":
         "Perfil actual": st.session_state.risk_profile,
         "Horizonte": st.session_state.horizon,
     })
+    st.markdown("---")
+    st.subheader("Persistencia y webhook")
+    backend_info = logbook.get_backend_info()
+    st.write(f"**Backend logbook actual:** {backend_info}")
+    if supabase_db.is_configured():
+        st.success("Supabase conectado: tu cartera persiste 24/7 en cloud.")
+    else:
+        st.info("Supabase NO configurado. En cloud el logbook se borra al dormir la app. "
+                "Configura SUPABASE_URL y SUPABASE_ANON_KEY en Streamlit Secrets.")
+    try:
+        cron_token = st.secrets.get("CRON_TOKEN", "")
+        if cron_token:
+            st.success("CRON_TOKEN configurado: webhook listo para alertas automaticas.")
+            try:
+                cur_url = "tu-app.streamlit.app"
+                st.caption(f"URL del webhook: https://{cur_url}/?action=check_drift&token=XXXXX (sustituye XXXXX)")
+            except Exception:
+                pass
+        else:
+            st.info("CRON_TOKEN no configurado. Anade un token aleatorio en Secrets para activar webhook de cron-job.org.")
+    except Exception:
+        pass
+    st.markdown("---")
     st.subheader("Brokers - comisiones")
     bk = pd.DataFrame.from_dict(BROKER_FEES, orient="index")
     st.dataframe(bk, use_container_width=True)
